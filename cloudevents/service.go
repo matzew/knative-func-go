@@ -100,9 +100,6 @@ func (s *Service) Start(ctx context.Context) (err error) {
 			s.stop <- err
 		}
 	}()
-	//log.Debug().Str("port", port()).Msg("Listening on port")
-	//
-	//return <-s.stop
 
 	log.Debug().Msg("waiting for stop signals or errors")
 	// Wait for either a context cancellation or a signal on the stop channel.
@@ -151,24 +148,6 @@ func (s *Service) Addr() net.Addr {
 		return nil
 	}
 	return s.listener.Addr()
-}
-
-// Stop serving
-func (s *Service) Stop() {
-	ctx, cancel := context.WithTimeout(context.Background(), ServerShutdownTimeout)
-	defer cancel()
-	if err := s.Shutdown(ctx); err != nil {
-		log.Warn().Err(err).Msg("error during shutdown")
-	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), InstanceStopTimeout)
-	defer cancel()
-
-	if i, ok := s.f.(Stopper); ok {
-		s.stop <- i.Stop(ctx)
-	} else {
-		s.stop <- nil
-	}
 }
 
 // NOTE: no Handle on service because of the need to decorate the handler
@@ -263,14 +242,14 @@ func (s *Service) startInstance(ctx context.Context) error {
 }
 
 func (s *Service) handleSignals() {
-	sigs := make(chan os.Signal, 1)
+	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs)
 	go func() {
 		for {
 			sig := <-sigs
 			if sig == syscall.SIGINT || sig == syscall.SIGTERM {
 				log.Debug().Any("signal", sig).Msg("signal received")
-				s.Stop()
+				s.stop <- nil
 			} else if runtime.GOOS == "linux" && sig == syscall.Signal(0x17) {
 				// Ignore SIGURG; signal 23 (0x17)
 				// See https://go.googlesource.com/proposal/+/master/design/24543-non-cooperative-preemption.md
