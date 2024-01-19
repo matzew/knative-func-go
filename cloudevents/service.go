@@ -4,6 +4,7 @@
 package cloudevents
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,14 +38,14 @@ func Start(i Handler) error {
 type Service struct {
 	http.Server
 	i    Handler
-	done chan error
+	stop chan error
 }
 
 // New Service which service the given instance.
 func New(i Handler) *Service {
 	svc := &Service{
 		i:    i,
-		done: make(chan error),
+		stop: make(chan error),
 		Server: http.Server{
 			Addr:              ":" + port(),
 			ReadTimeout:       30 * time.Second,
@@ -63,14 +65,33 @@ func New(i Handler) *Service {
 
 // Start serving
 func (s *Service) Start(ctx context.Context) (err error) {
-	if i, ok := s.i.(Starter); ok {
-		if err = i.Start(ctx, allEnvs()); err != nil {
-			return
-		}
+	// Start
+	// Starts the function instance in a separate routine, sending any
+	// runtime errors on s.stop.
+	if err = s.startInstance(ctx); err != nil {
+		return
 	}
+
 	s.handleRequests()
 	s.handleSignals()
-	return <-s.done
+	return <-s.stop
+}
+
+func (s *Service) startInstance(ctx context.Context) error {
+	if i, ok := s.i.(Starter); ok {
+		cfg, err := newCfg()
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := i.Start(ctx, cfg); err != nil {
+				s.stop <- err
+			}
+		}()
+	} else {
+		log.Debug().Msg("function does not implement Start. Skipping")
+	}
+	return nil
 }
 
 // Stop serving
@@ -85,9 +106,9 @@ func (s *Service) Stop() {
 	defer cancel()
 
 	if i, ok := s.i.(Stopper); ok {
-		s.done <- i.Stop(ctx)
+		s.stop <- i.Stop(ctx)
 	} else {
-		s.done <- nil
+		s.stop <- nil
 	}
 }
 
@@ -192,21 +213,21 @@ func (s *Service) handleRequests() {
 	go func() {
 		if err := s.Server.ListenAndServe(); err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("http server exited with unexpected error")
-			s.done <- err
+			s.stop <- err
 		}
 	}()
 	log.Debug().Str("port", port()).Msg("Listening on port")
 }
 
 func (s *Service) handleSignals() {
-	sigs := make(chan os.Signal, 1)
+	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs)
 	go func() {
 		for {
 			sig := <-sigs
 			if sig == syscall.SIGINT || sig == syscall.SIGTERM {
 				log.Debug().Any("signal", sig).Msg("signal received")
-				s.Stop()
+				s.stop <- nil
 			} else if runtime.GOOS == "linux" && sig == syscall.Signal(0x17) {
 				// Ignore SIGURG; signal 23 (0x17)
 				// See https://go.googlesource.com/proposal/+/master/design/24543-non-cooperative-preemption.md
@@ -222,10 +243,45 @@ func port() (p string) {
 	return os.Getenv("PORT")
 }
 
-func allEnvs() (envs map[string]string) {
-	envs = make(map[string]string, len(os.Environ()))
+// readCfg returns a map representation of ./cfg
+// Empty map is returned if ./cfg does not exist.
+// Error is returned for invalid entries.
+// keys and values are space-trimmed.
+// Quotes are removed from values.
+func readCfg() (map[string]string, error) {
+	cfg := map[string]string{}
+
+	f, err := os.Open("cfg")
+	if err != nil {
+		log.Debug().Msg("no static config")
+		return cfg, nil
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	i := 0
+	for scanner.Scan() {
+		i++
+		line := scanner.Text()
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			return cfg, fmt.Errorf("config line %v invalid: %v", i, line)
+		}
+		cfg[strings.TrimSpace(parts[0])] = strings.Trim(strings.TrimSpace(parts[1]), "\"")
+	}
+	return cfg, scanner.Err()
+}
+
+// newCfg creates a final map of config values built from the static
+// values in `cfg` and all environment variables.
+func newCfg() (cfg map[string]string, err error) {
+	if cfg, err = readCfg(); err != nil {
+		return
+	}
+
 	for _, e := range os.Environ() {
-		envs[e] = os.Getenv(e)
+		pair := strings.SplitN(e, "=", 2)
+		cfg[pair[0]] = pair[1]
 	}
 	return
 }
