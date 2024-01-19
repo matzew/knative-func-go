@@ -28,22 +28,24 @@ const (
 )
 
 // Start an intance using a new Service
-func Start(i Handler) error {
+// Note that for CloudEvent Handlers this effectively accepts ANY because
+// the actual type of the handler function is determined later.
+func Start(f any) error {
 	log.Debug().Msg("func runtime creating function instance")
-	return New(i).Start(context.Background())
+	return New(f).Start(context.Background())
 }
 
 // Service exposes a Function Instance as a an HTTP service.
 type Service struct {
 	http.Server
-	i    Handler
+	f    any
 	stop chan error
 }
 
 // New Service which service the given instance.
-func New(i Handler) *Service {
+func New(f any) *Service {
 	svc := &Service{
-		i:    i,
+		f:    f,
 		stop: make(chan error),
 		Server: http.Server{
 			Addr:              ":" + port(),
@@ -57,7 +59,7 @@ func New(i Handler) *Service {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health/readiness", svc.Ready)
 	mux.HandleFunc("/health/liveness", svc.Alive)
-	mux.Handle("/", newCloudeventHandler(i)) // See implementation note
+	mux.Handle("/", newCloudeventHandler(f)) // See implementation note
 	svc.Server.Handler = mux
 	return svc
 }
@@ -95,7 +97,7 @@ func (s *Service) Stop() {
 	ctx, cancel = context.WithTimeout(context.Background(), InstanceStopTimeout)
 	defer cancel()
 
-	if i, ok := s.i.(Stopper); ok {
+	if i, ok := s.f.(Stopper); ok {
 		s.stop <- i.Stop(ctx)
 	} else {
 		s.stop <- nil
@@ -134,7 +136,7 @@ func newCloudeventHandler(f any) http.Handler {
 
 // Ready handles readiness checks.
 func (s *Service) Ready(w http.ResponseWriter, r *http.Request) {
-	if i, ok := s.i.(ReadinessReporter); ok {
+	if i, ok := s.f.(ReadinessReporter); ok {
 		ready, err := i.Ready(r.Context())
 		if err != nil {
 			message := "error checking readiness"
@@ -156,7 +158,7 @@ func (s *Service) Ready(w http.ResponseWriter, r *http.Request) {
 
 // Alive handles liveness checks.
 func (s *Service) Alive(w http.ResponseWriter, r *http.Request) {
-	if i, ok := s.i.(LivenessReporter); ok {
+	if i, ok := s.f.(LivenessReporter); ok {
 		alive, err := i.Alive(r.Context())
 		if err != nil {
 			message := "error checking liveness"
@@ -177,7 +179,7 @@ func (s *Service) Alive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) startInstance(ctx context.Context) error {
-	if i, ok := s.i.(Starter); ok {
+	if i, ok := s.f.(Starter); ok {
 		cfg, err := newCfg()
 		if err != nil {
 			return err
